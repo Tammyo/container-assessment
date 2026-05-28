@@ -2,7 +2,14 @@ name: Backend CI/CD
 
 on:
   push:
-    branches: [feature/full-stack]
+    branches:
+      - main
+      - feature/full-stack
+    paths:
+      - 'Server/**'
+  pull_request:
+    branches:
+      - main
     paths:
       - 'Server/**'
   workflow_dispatch:
@@ -10,51 +17,61 @@ on:
 env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: starttech-backend
-  IMAGE_TAG: ${{ github.sha }}
 
 jobs:
   test:
-    name: Test and Quality Check
+    name: Test and Lint
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: Server
+        working-directory: Server/MuchToDo
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Setup Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
           go-version: '1.21'
+          cache-dependency-path: Server/MuchToDo/go.sum
 
       - name: Install dependencies
         run: go mod download
 
       - name: Run tests
-        run: go test ./... -v -coverprofile=coverage.out
+        run: go test ./... -v -timeout 30s
 
       - name: Run go vet
         run: go vet ./...
 
-      - name: Vulnerability scan
+      - name: Install staticcheck
+        run: go install honnef.co/go/tools/cmd/staticcheck@latest
+
+      - name: Run staticcheck
+        run: staticcheck ./...
+        continue-on-error: true
+
+      - name: Check for vulnerabilities
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
           govulncheck ./...
         continue-on-error: true
 
-  build-and-push:
+  build:
     name: Build and Push Docker Image
     runs-on: ubuntu-latest
     needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -62,42 +79,55 @@ jobs:
 
       - name: Login to Amazon ECR
         id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v1
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Generate image tag
+        id: meta
+        run: echo "tag=${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Create ECR repository if not exists
+        run: |
+          aws ecr describe-repositories \
+            --repository-names ${{ env.ECR_REPOSITORY }} \
+            --region ${{ env.AWS_REGION }} || \
+          aws ecr create-repository \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --region ${{ env.AWS_REGION }}
 
       - name: Build Docker image
+        working-directory: Server/MuchToDo
         run: |
-          docker build -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }} \
-            -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest \
-            ./Server
+          docker build -t ${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }} .
+          docker tag ${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }} \
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}
+          docker tag ${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }} \
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
 
       - name: Scan Docker image for vulnerabilities
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+          image-ref: ${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}
           format: table
-          exit-code: '0'
+          exit-code: 0
           severity: HIGH,CRITICAL
 
       - name: Push Docker image to ECR
         run: |
-          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}
           docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
-
-      - name: Save image URI
-        run: |
-          echo "IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}" >> $GITHUB_ENV
 
   deploy:
     name: Deploy to EC2
     runs-on: ubuntu-latest
-    needs: build-and-push
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -105,37 +135,47 @@ jobs:
 
       - name: Login to Amazon ECR
         id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v1
+        uses: aws-actions/amazon-ecr-login@v2
 
       - name: Deploy to EC2 via SSM
         run: |
+          ASG_NAME="${{ secrets.ASG_NAME }}"
+          IMAGE="${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.build.outputs.image_tag }}"
+
           INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
-            --auto-scaling-group-names starttech-backend-asg \
+            --auto-scaling-group-names $ASG_NAME \
             --query 'AutoScalingGroups[0].Instances[*].InstanceId' \
             --output text)
 
           for INSTANCE_ID in $INSTANCE_IDS; do
+            echo "Deploying to instance: $INSTANCE_ID"
             aws ssm send-command \
-              --instance-ids "$INSTANCE_ID" \
+              --instance-ids $INSTANCE_ID \
               --document-name "AWS-RunShellScript" \
-              --parameters commands=[
-                "aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ steps.login-ecr.outputs.registry }}",
-                "docker pull ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}",
-                "docker stop starttech-backend || true",
-                "docker rm starttech-backend || true",
-                "docker run -d --name starttech-backend -p 8080:8080 --restart always --log-driver=awslogs --log-opt awslogs-group=/starttech/backend --log-opt awslogs-region=${{ env.AWS_REGION }} -e MONGO_URI=${{ secrets.MONGO_URI }} -e REDIS_ENDPOINT=${{ secrets.REDIS_ENDPOINT }} ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}"
-              ] \
+              --parameters commands="[
+                'aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ steps.login-ecr.outputs.registry }}',
+                'docker pull $IMAGE',
+                'docker stop starttech-backend || true',
+                'docker rm starttech-backend || true',
+                'docker run -d --name starttech-backend --restart always -p 8080:8080 --log-driver=awslogs --log-opt awslogs-group=/starttech/starttech/app --log-opt awslogs-region=${{ env.AWS_REGION }} -e MONGODB_URI=${{ secrets.MONGODB_URI }} -e REDIS_HOST=${{ secrets.REDIS_HOST }} -e PORT=8080 $IMAGE'
+              ]" \
               --region ${{ env.AWS_REGION }}
           done
 
-      - name: Health check
+      - name: Wait and run smoke test
         run: |
+          echo "Waiting 30 seconds for deployment to stabilize..."
           sleep 30
-          ALB_DNS=$(aws elbv2 describe-load-balancers \
-            --names starttech-alb \
-            --query 'LoadBalancers[0].DNSName' \
-            --output text)
-          curl -f http://$ALB_DNS/health || exit 1
+          ALB_DNS="${{ secrets.ALB_DNS_NAME }}"
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://$ALB_DNS/health)
+          if [ "$RESPONSE" = "200" ]; then
+            echo "✅ Smoke test passed! Health check returned 200"
+          else
+            echo "❌ Smoke test failed! Health check returned $RESPONSE"
+            exit 1
+          fi
 
-      - name: Notify deployment success
-        run: echo "✅ Backend deployed successfully to EC2!"
+      - name: Deployment complete
+        run: |
+          echo "✅ Backend deployed successfully!"
+          echo "🌍 URL: http://${{ secrets.ALB_DNS_NAME }}"
