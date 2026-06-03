@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backend-configmap
+  namespace: muchtodo
+data:
+  PORT: "8080"
+  MONGO_HOST: mongodb-service
+  MONGO_PORT: "27017"
+  MONGO_DB: muchtodo
+  .env: |
+    PORT=8080
+    MONGO_URI=mongodb://admin:password123@mongodb-service:27017/muchtodo?authSource=admin
+    DB_NAME=muchtodo
+    JWT_SECRET_KEY=supersecretkey
+    JWT_EXPIRATION_HOURS=72
+    ENABLE_CACHE=false

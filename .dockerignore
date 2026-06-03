@@ -1,0 +1,10 @@
+.git
+.gitignore
+README.md
+docker-compose.yml
+kubernetes/
+scripts/
+evidence/
+*.md
+.env
+.env.*

@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: muchtodo-backend
+    ports:
+      - "8080:8080"
+    environment:
+      - MONGO_URI=mongodb://admin:password123@mongodb:27017/muchtodo?authSource=admin
+      - DB_NAME=muchtodo
+      - PORT=8080
+      - JWT_SECRET_KEY=supersecretkey
+      - ENABLE_CACHE=false
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - muchtodo-network
+
+  mongodb:
+    image: mongo:6.0
+    container_name: muchtodo-mongodb
+    ports:
+      - "27017:27017"
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=admin
+      - MONGO_INITDB_ROOT_PASSWORD=password123
+      - MONGO_INITDB_DATABASE=muchtodo
+    volumes:
+      - mongodb-data:/data/db
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    restart: unless-stopped
+    networks:
+      - muchtodo-network
+
+volumes:
+  mongodb-data:
+    driver: local
+
+networks:
+  muchtodo-network:
+    driver: bridge
